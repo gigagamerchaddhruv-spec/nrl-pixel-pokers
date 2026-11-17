@@ -1,477 +1,574 @@
 #include "NRL.h"
 #include "team205_mech.h"
-#include <Wire.h>
-#include <math.h>
 
 // ============================================================
-//  DriveMode — Tank Drive, IMU Auto-Level, Arm, Claw & Payload
+//  DriveMode — Dual-Stick Tank Drive, Arm, Claw & Payload Gate
 // ============================================================
-//  SERVO PORTS ON HEXA COMMAND HUB (Standard 3-pin plug, Red in middle):
-//      SERVO_1 (S1) -> ARM           (45° = up, 115° = floor)
-//      SERVO_4 (S4) -> CLAW          (30° = open, 95° = closed)
-//      SERVO_3 (S3) -> PAYLOAD GATE  (0° = closed, 90° = open)
+//  HARDWARE (3 servos, 3 separate mechanisms):
+//      SERVO_1 -> ARM           (one axis: up / down)
+//      SERVO_2 -> CLAW          (one axis: expand / contract)
+//      SERVO_3 -> PAYLOAD GATE  (one axis: open / closed)
 //
 //  Controls:
 //  - TRUE TANK DRIVE:
-//      * Left Stick Y   = Left Wheels
-//      * Right Stick Y  = Right Wheels
-//  - SPACESTATION AUTO-LEVEL (Onboard IMU):
-//      * BTN_X          = Press once to START leveling, press X again to STOP
-//  - PRECISION TURN SHORTCUTS:
-//      * BTN_RB         = Turn 140° at 90% speed
-//      * BTN_LB         = Turn 50°  at 80% speed
-//  - ARM (S1):
-//      * BTN_DPAD_UP    = Arm UP
-//      * BTN_DPAD_DOWN  = Arm DOWN + Automatically OPENS Claw (30°)
-//  - CLAW (S4):
-//      * BTN_DPAD_RIGHT = Claw OPEN (30°)
-//      * BTN_DPAD_LEFT  = Claw CLOSE (95°)
-//  - PAYLOAD GATE (S3):
-//      * BTN_A          = Press once to OPEN 90°, press A again to CLOSE 0°
+//      * Left stick Y  = Left Motor directly
+//      * Right stick Y = Right Motor directly
+//  - ARM (hold to move, release to stop):
+//      * BTN_DPAD_UP    = arm UP
+//      * BTN_DPAD_DOWN  = arm DOWN
+//  - CLAW (toggle on, travels to its limit; toggle off to stop):
+//      * BTN_LT         = claw EXPAND
+//      * BTN_RT         = claw CONTRACT
+//  - CLAW SNAPS & MACRO:
+//      * BTN_A          = snap fully closed (and engage the grip)
+//      * BTN_Y          = one-touch auto-grab (open -> clamp + chime) / release
+//  - PAYLOAD GATE (press once to toggle):
+//      * BTN_X          = toggle the payload gate OPEN / CLOSED
+//  - FULL STRAIGHT DRIVE:
+//      * Hold BTN_RB: 100% full speed sprint with Gyro Heading Lock!
+//  - GYRO SPIN MACROS:
+//      * BTN_LB          = Instant 180° gyro turnaround
+//      * BTN_DPAD_LEFT   = Instant 90° left pivot
+//      * BTN_DPAD_RIGHT  = Instant 90° right pivot
+//
+//  ------------------------------------------------------------------
+//  SERVO ANGLE DIRECTION — MEASURED, DO NOT "FIX"
+//  ------------------------------------------------------------------
+//  Both servos are mounted so that a HIGHER angle rotates them in the
+//  direction that CLOSES / LOWERS the mechanism:
+//
+//      ARM:    45 deg = raised (carry)   115 deg = lowered (floor)
+//      CLAW:  125 deg = open             155 deg = closed
+//
+//  So the arm goes UP by DECREASING its angle, and the claw CLOSES by
+//  INCREASING its angle. The direction flags below are written to match that,
+//  and each one carries a comment saying which way the angle moves.
+//
+//  These angles come from the team's own calibration on the real robot
+//  (Controller -> SERVO TEST). They are the source of truth for this robot.
 // ============================================================
 
-static HexaDCMotor leftMotor ({ .dirPin = MOTOR_L_DIR, .pwmPin = MOTOR_L_PWM, .flipped = true,  .minDrive = 29 });
-static HexaDCMotor rightMotor({ .dirPin = MOTOR_R_DIR, .pwmPin = MOTOR_R_PWM, .flipped = false, .minDrive = 32 });
+// Drive motors on the Hexa Command Hub
+static HexaDCMotor leftMotor({ .dirPin = MOTOR_L_DIR, .pwmPin = MOTOR_L_PWM, .flipped = true });
+static HexaDCMotor rightMotor({ .dirPin = MOTOR_R_DIR, .pwmPin = MOTOR_R_PWM, .flipped = false });
 static TankDrive   drive(leftMotor, rightMotor);
+static DriveActions driveActions(drive);
 
-// Servo ports on the HEXA Command Hub
-static constexpr uint8_t ARM_SIGNAL_PIN     = SERVO_1;  // S1
-static constexpr uint8_t CLAW_SIGNAL_PIN    = SERVO_4;  // S4 (J20)
-static constexpr uint8_t PAYLOAD_SIGNAL_PIN = SERVO_3;  // S3 (J17)
+// Which physical servo is the arm and which is the claw.
+static constexpr uint8_t ARM_SIGNAL_PIN  = SERVO_1;  // GPIO 39
+static constexpr uint8_t CLAW_SIGNAL_PIN = SERVO_2;  // GPIO 40
+static constexpr uint8_t PAYLOAD_SIGNAL_PIN = SERVO_3;  // GPIO 41
 
-// ---- IMU AUTO-LEVEL TUNING (Button X Toggle) -----------------------------
-// 1. If tilting the robot nose-up does NOT change "Tilt" on the screen,
-//    flip USE_Y_AXIS_FOR_PITCH from false to true.
-// 2. If the robot drives DOWN the ramp instead of UP toward level,
-//    flip LEVEL_DRIVE_SIGN between 1.0f and -1.0f.
-static constexpr bool  USE_Y_AXIS_FOR_PITCH = false;
-static constexpr float LEVEL_DRIVE_SIGN     =  1.0f;
-static constexpr float LEVEL_KP             =  0.022f;  // Proportional climb gain
-static constexpr float LEVEL_KD             =  0.008f;  // Damping gain (stops see-saw bounce)
-static constexpr float LEVEL_DEADBAND_DEG   =  1.5f;    // Stop motors within ±1.5° of flat
-static constexpr float LEVEL_MIN_POWER      =  0.16f;   // Minimum power to overcome ramp friction
-static constexpr float LEVEL_MAX_POWER      =  0.48f;   // Max power so robot won't overshoot ramp
+// ---- ARM: calibrated angles (measured on this robot) ---------------------
+static constexpr float ARM_CARRY_ANGLE = 45.0f;   // raised / carry position
+static constexpr float ARM_FLOOR_ANGLE = 115.0f;  // lowered to the floor
+static constexpr float ARM_HOME_ANGLE  = ARM_CARRY_ANGLE;
 
-// ---- PRECISION TURN TUNING (RB = 140° @ 90%, LB = 50° @ 80%) --------------
-static constexpr float    TURN_140_DIR      =  1.0f;
-static constexpr float    TURN_140_SPEED    =  0.90f;   // 90% speed
-static constexpr uint32_t TURN_140_MS       =  380;     // Duration for 140°
+// ---- CLAW: calibrated angles (measured on this robot) --------------------
+static constexpr float CLAW_OPEN_ANGLE   = 125.0f;  // wide open
+static constexpr float CLAW_CLOSED_ANGLE = 155.0f;  // jaws shut
 
-static constexpr float    TURN_50_DIR       = -1.0f;
-static constexpr float    TURN_50_SPEED     =  0.80f;   // 80% speed
-static constexpr uint32_t TURN_50_MS        =  165;     // Duration for 50°
+// ------------------------------------------------------------------
+//  GRIP PRESSURE
+//
+//  A servo applies force only while it is still trying to REACH its commanded
+//  angle. If the claw is commanded to exactly CLAW_CLOSED_ANGLE, the servo
+//  arrives, stops pushing, and holds nothing — the piece is then held by
+//  friction alone and falls out the moment the robot moves.
+//
+//  So once the jaws are shut on a piece, the servo is commanded PAST
+//  CLAW_CLOSED_ANGLE to CLAW_GRIP_ANGLE. The piece blocks the jaws short of
+//  that, so the servo never arrives, keeps straining, and presses.
+//
+//  PRESSURE TUNING: a LARGER CLAW_GRIP_ANGLE = a tighter squeeze = more
+//  force. Raise it for a stronger grip; lower it if the servo starts buzzing
+//  hard, bogging down, or the arm lags behind when it moves.
+//
+//  ⚠ This is also the biggest current draw on the board. See the brownout
+//  note below before raising it.
+// ------------------------------------------------------------------
+static constexpr float CLAW_GRIP_ANGLE = 168.0f;
 
-static constexpr uint32_t TURN_BRAKE_MS     =  45;      // Active reverse brake pulse
+// ---- PAYLOAD GATE: angles and button ------------------------------------
+// The payload gate is a third mechanism on its own servo. CLOSED is its
+// starting pose; OPEN swings it 90 degrees clear.
+//
+// These two angles are the ones from the team's payload-toggle design. Unlike
+// the arm and the claw, they were NOT measured on this robot — measure them
+// in Controller -> SERVO TEST and correct them here if the gate does not
+// travel the way you expect.
+static constexpr float PAYLOAD_CLOSED_ANGLE = 0.0f;
+static constexpr float PAYLOAD_OPEN_ANGLE   = 90.0f;
 
-// ---- ARM ANGLES (S1) -----------------------------------------------------
-static constexpr float ARM_UP_ANGLE         = 45.0f;    // Raised carry height
-static constexpr float ARM_DOWN_ANGLE       = 115.0f;   // Lowered floor height
-static constexpr float ARM_STEP_PER_TICK    = 1.2f;     // Smooth 120 deg/s travel
+// Which button toggles the payload gate. Change this one line to move it.
+static constexpr uint16_t PAYLOAD_BUTTON = BTN_X;
 
-// ---- CLAW ANGLES (S4 — Calibrated: 30° open, 95° fully closed) -----------
-static constexpr float CLAW_OPEN_ANGLE      = 30.0f;    // Fully open
-static constexpr float CLAW_CLOSED_ANGLE    = 95.0f;    // Fully closed
-static constexpr float CLAW_STEP_PER_TICK   = 2.2f;     // Crisp ~0.3s open/close
+// ------------------------------------------------------------------
+//  TRAVEL SPEEDS — DEGREES PER SECOND
+//
+//  The servo ramps toward the target on its own, advancing one step per
+//  setPosition() call. The ramp rate is the single source of truth for
+//  motion — do NOT also step the target angle by hand, because two rate
+//  systems fight and the servo never converges.
+//
+//  These are also the current limit for the mechanism: a faster rate makes
+//  the battery rail dip harder (see the brownout note below).
+// ------------------------------------------------------------------
+static constexpr float ARM_RATE_DEG_PER_SEC  = 90.0f;   // arm travel speed
+static constexpr float CLAW_RATE_DEG_PER_SEC = 120.0f;  // claw travel speed
+static constexpr float PAYLOAD_RATE_DEG_PER_SEC = 180.0f; // gate travel speed
 
-// ---- PAYLOAD GATE (S3): 90° OPEN / CLOSE TOGGLE ON BUTTON A ---------------
-static constexpr float PAYLOAD_CLOSED_ANGLE = 0.0f;     // Closed position
-static constexpr float PAYLOAD_OPEN_ANGLE   = 90.0f;    // +90° Open position
-static constexpr float PAYLOAD_STEP_PER_TICK = 3.5f;    // Crisp 90° toggle
+// ------------------------------------------------------------------
+//  BROWNOUT — why two servos moving at once can stop them working
+//
+//  "The servos share the battery rail. There is NO BEC and no separate servo
+//  regulator." (HexaServo.h) Moving the arm AND the claw at the same time
+//  doubles the current the rail must supply. If that pulls the rail down
+//  far enough, the ESP32 browns out and resets.
+//
+//  A reset is not a small inconvenience: init() runs again, and the claw is
+//  re-initialised OPEN. That is the "servo automatically opens" symptom —
+//  and the piece you were carrying is on the floor.
+//
+//  Four things here stop that from happening:
+//
+//    1. MOTION ARBITRATION (see team205_mech.h). Only one mechanism TRAVELS
+//       at a time. A deferred move is not lost — it starts as soon as the
+//       rail is quiet again. This is the big one.
+//
+//    2. POWER DERATE (PowerGuard). When the pack sags, the drive output is
+//       scaled back so the robot crawls instead of pulling the rail under.
+//       This is what fixes "drive while gripping kills the claw".
+//
+//    3. GRIP MEMORY (GripMemory). If a reset does happen, the claw comes back
+//       CLOSED on the piece instead of open.
+//
+//    4. Modest travel rates. Raising them makes the rail dip harder.
+//
+//  To confirm a brownout on the field: watch "Boot #" on the Controller. If
+//  it climbs while you drive, the board is resetting.
+// ------------------------------------------------------------------
 
-// ---- CARRY-MODE DRIVE PROTECTION -----------------------------------------
-static constexpr float CARRY_MAX_DRIVE      = 0.80f;
-static constexpr float CARRY_ACCEL_PER_TICK = 0.05f;
-
-static HexaServo arm    ({ .signalPin = ARM_SIGNAL_PIN,     .startAngle = ARM_UP_ANGLE });
+// The three mechanisms.
+static HexaServo arm    ({ .signalPin = ARM_SIGNAL_PIN,     .startAngle = ARM_HOME_ANGLE });
 static HexaServo claw   ({ .signalPin = CLAW_SIGNAL_PIN,    .startAngle = CLAW_OPEN_ANGLE });
 static HexaServo payload({ .signalPin = PAYLOAD_SIGNAL_PIN, .startAngle = PAYLOAD_CLOSED_ANGLE });
 
-static float armCmdDeg      = ARM_UP_ANGLE;
-static float clawCmdDeg     = CLAW_OPEN_ANGLE;
-static float payloadCmdDeg  = PAYLOAD_CLOSED_ANGLE;
+// The mechanism wrappers. See team205_mech.h for what these fix.
+static ServoAxis  armAxis;
+static ServoAxis  clawAxis;
+static ServoAxis  payloadAxis;
 
-static bool  clawGripLocked = false;
-static bool  payloadOpen    = false;
-static float smoothedLeft   = 0.0f;
-static float smoothedRight  = 0.0f;
+// The claw's state machine (open / closing / gripping).
+static ClawControl clawCtl;
 
-// Timed + Brake Turn state
-static bool     turnActive       = false;
-static float    turnPowerCmd     = 0.0f;
-static uint32_t turnSpinEndMs    = 0;
-static uint32_t turnBrakeEndMs   = 0;
-static float    turnTargetDegLog = 0.0f;
+// Which way the arm is being driven right now.
+enum class ArmDir { NONE, UP, DOWN };
 
-// Onboard LSM6DS IMU Auto-Level state
-static uint8_t  imuAddr          = 0;
-static bool     autoLevelActive  = false;
-static float    levelZeroDeg     = 0.0f;
-static float    filteredTiltDeg  = 0.0f;
-static float    prevLevelErrDeg  = 0.0f;
-static uint32_t prevLevelMs      = 0;
+// What an in-flight macro owns. Macro::NONE means the manual controls have the
+// parts back. A macro that has run to completion stops owning anything.
+enum class Macro { NONE, TURN, GRAB };
 
-static PowerGuard     powerGuard;
+static Macro  activeMacro        = Macro::NONE;
+static ArmDir armDir             = ArmDir::NONE;
+static bool   objectSecured      = false;
+static bool   fullStraightActive = false;
+static float  lockedHeading      = 0.0f;
+static bool   payloadOpen        = false;    // payload gate state
+
+// Power / brownout state.
+static PowerGuard      powerGuard;
 static BrownoutBeacon brownoutBeacon;
-static GripMemory     gripMemory;
+static GripMemory      gripMemory;
 
+// ------------------------------------------------------------
+//  Raw button state
+//
+//  gamepad1.pressed() hides a button that was already held when the OpMode
+//  started, until it is released once (Gamepad::ignoreHeldButtons). That is
+//  right for menus, but it means a trigger the driver is ALREADY holding when
+//  the OpMode starts does nothing — which reads as "the button doesn't work".
+//
+//  NRLGamepad::read() gives the raw packet contents with no hiding, so a
+//  held control works immediately. The arm and claw read through it for that
+//  reason; the discrete macros still use gamepad1.justPressed() because they
+//  need a clean edge.
+// ------------------------------------------------------------
 static uint16_t rawButtons = 0;
 
-// ------------------------------------------------------------
-//  Direct Non-Invasive LSM6DS IMU Helpers (Reads pitch safely)
-// ------------------------------------------------------------
-static bool probeImuAddress(uint8_t addr) {
-    Wire.beginTransmission(addr);
-    Wire.write(0x0F); // WHO_AM_I register
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((uint8_t)addr, (uint8_t)1) != 1) return false;
-    uint8_t who = Wire.read();
-    return (who == 0x69 || who == 0x6A || who == 0x6C);
-}
-
-static bool readRawImuTilt(float& outDeg) {
-    if (imuAddr == 0) return false;
-
-    Wire.beginTransmission(imuAddr);
-    Wire.write(0x28); // OUTX_L_A (6 accelerometer bytes)
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom((uint8_t)imuAddr, (uint8_t)6) != 6) return false;
-
-    uint8_t xl = Wire.read();
-    uint8_t xh = Wire.read();
-    uint8_t yl = Wire.read();
-    uint8_t yh = Wire.read();
-    uint8_t zl = Wire.read();
-    uint8_t zh = Wire.read();
-
-    int16_t ax = (int16_t)((xh << 8) | xl);
-    int16_t ay = (int16_t)((yh << 8) | yl);
-    int16_t az = (int16_t)((zh << 8) | zl);
-
-    float pitchAxis = USE_Y_AXIS_FOR_PITCH ? (float)ay : (float)ax;
-    float zAxis     = (float)az;
-    if (fabsf(pitchAxis) < 1.0f && fabsf(zAxis) < 1.0f) return false;
-
-    outDeg = atan2f(pitchAxis, zAxis) * 57.29578f;
-    return true;
-}
-
-static void initImuForLeveling() {
-    imuAddr = 0;
-    if (probeImuAddress(0x6A)) {
-        imuAddr = 0x6A;
-    } else if (probeImuAddress(0x6B)) {
-        imuAddr = 0x6B;
-    }
-
-    if (imuAddr == 0) return;
-
-    // Ensure accelerometer is enabled (104 Hz, ±2g) if it was powered down
-    Wire.beginTransmission(imuAddr);
-    Wire.write(0x10); // CTRL1_XL
-    if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)imuAddr, (uint8_t)1) == 1) {
-        uint8_t ctrl1 = Wire.read();
-        if (ctrl1 == 0x00) {
-            Wire.beginTransmission(imuAddr);
-            Wire.write(0x10);
-            Wire.write(0x40);
-            Wire.endTransmission(true);
-        }
-    }
-
-    // Calibrate resting flat angle as 0.0° baseline
-    float sum = 0.0f;
-    int validSamples = 0;
-    for (int i = 0; i < 12; i++) {
-        float deg = 0.0f;
-        if (readRawImuTilt(deg)) {
-            sum += deg;
-            validSamples++;
-        }
-        delay(5);
-    }
-
-    if (validSamples > 0) {
-        levelZeroDeg    = sum / (float)validSamples;
-        filteredTiltDeg = levelZeroDeg;
-    }
-}
-
-static void refreshRawButtons() {
+static void readRawButtons() {
     float lx, ly, rx, ry;
     uint16_t btns = 0;
     NRLGamepad::read(lx, ly, rx, ry, btns);
     rawButtons = btns;
 }
 
-static bool isBtnPressed(uint16_t btn) {
-    return gamepad1.pressed(btn) || ((rawButtons & btn) != 0);
-}
+static bool rawPressed(uint16_t btn) { return (rawButtons & btn) != 0; }
 
-static float stepAngle(float current, float target, float maxStep) {
-    if (target > current + maxStep) return current + maxStep;
-    if (target < current - maxStep) return current - maxStep;
-    return target;
-}
+// ------------------------------------------------------------
+//  Auto-Grab Non-Blocking Action Routine
+// ------------------------------------------------------------
+static ActionPtr autoGrabRoutine() {
+    return sequential({
+        // 1. Clamp firmly on game piece immediately
+        instant([]{
+            userLed.setSolid(255, 120, 0); // Orange: Clamping
+            clawCtl.tryClose();
+        }),
+        sleep_ms(300),
 
-static float slewDrive(float current, float target, float maxStep) {
-    if (target > current + maxStep) return current + maxStep;
-    if (target < current - maxStep) return current - maxStep;
-    return target;
-}
+        // 2. Strain the servo past the jaws so it presses on the piece
+        instant([]{
+            clawCtl.engageNow();
+            objectSecured = true;
+            gripMemory.set(true);
+        }),
+        sleep_ms(80),
 
-static void startPrecisionTurn(float targetDeg, float speed, uint32_t durationMs, float directionSign) {
-    uint32_t now     = millis();
-    turnTargetDegLog = targetDeg * directionSign;
-    turnPowerCmd     = speed * directionSign;
-    turnSpinEndMs    = now + durationMs;
-    turnBrakeEndMs   = turnSpinEndMs + TURN_BRAKE_MS;
-    turnActive       = true;
-    autoLevelActive  = false;
-}
-
-static void updatePrecisionTurn(float driveScale) {
-    uint32_t now = millis();
-    if (now < turnSpinEndMs) {
-        drive.drive(0.0f, turnPowerCmd * driveScale);
-    } else if (now < turnBrakeEndMs) {
-        drive.drive(0.0f, -turnPowerCmd * 0.55f);
-    } else {
-        drive.stop();
-        turnActive = false;
-    }
+        // 3. Dual audio chime & set secured indicator
+        instant([]{
+            tone(BUZZER_PIN, 1800, 60);
+        }),
+        sleep_ms(60),
+        instant([]{
+            tone(BUZZER_PIN, 2400, 100);
+            userLed.setSolid(180, 0, 255); // Purple: Object Secured
+        })
+    });
 }
 
 class DriveMode : public NRLOpMode {
 public:
     void init() override {
-        gripMemory.begin();
-
+        // Servos first, then drive motors
+        arm.setRampRate(ARM_RATE_DEG_PER_SEC);
+        claw.setRampRate(CLAW_RATE_DEG_PER_SEC);
+        payload.setRampRate(PAYLOAD_RATE_DEG_PER_SEC);
         arm.begin();
         claw.begin();
         payload.begin();
         leftMotor.begin();
         rightMotor.begin();
 
-        initImuForLeveling();
+        // Bind the mechanism wrappers to the drivers. The wrapper holds the
+        // TARGET; apply() pushes it to the driver every tick.
+        armAxis.bind(arm, ARM_HOME_ANGLE, ARM_CARRY_ANGLE, ARM_FLOOR_ANGLE);
+        clawAxis.bind(claw, CLAW_OPEN_ANGLE, CLAW_OPEN_ANGLE, CLAW_CLOSED_ANGLE);
+        payloadAxis.bind(payload, PAYLOAD_CLOSED_ANGLE, PAYLOAD_CLOSED_ANGLE, PAYLOAD_OPEN_ANGLE);
+        clawCtl.bind(clawAxis, CLAW_OPEN_ANGLE, CLAW_CLOSED_ANGLE, CLAW_GRIP_ANGLE);
 
-        armCmdDeg       = ARM_UP_ANGLE;
-        payloadOpen     = false;
-        payloadCmdDeg   = PAYLOAD_CLOSED_ANGLE;
-        turnActive      = false;
-        autoLevelActive = false;
-        smoothedLeft    = 0.0f;
-        smoothedRight   = 0.0f;
+        objectSecured      = false;
+        activeMacro        = Macro::NONE;
+        armDir             = ArmDir::NONE;
+        fullStraightActive = false;
+        payloadOpen        = false;
 
+        // If the board came up from a brownout, restore the grip so the claw
+        // comes back CLOSED on the piece instead of dropping it.
+        gripMemory.begin();
         if (gripMemory.engaged) {
-            clawGripLocked = true;
-            clawCmdDeg     = CLAW_CLOSED_ANGLE;
+            clawCtl.engageNow();
+            objectSecured = true;
         } else {
-            clawGripLocked = false;
-            clawCmdDeg     = CLAW_OPEN_ANGLE;
+            clawAxis.command(CLAW_OPEN_ANGLE);
         }
 
-        arm.setPosition(armCmdDeg);
-        claw.setPosition(clawCmdDeg);
-        payload.setPosition(payloadCmdDeg);
+        armAxis.command(ARM_HOME_ANGLE);
+        payloadAxis.command(PAYLOAD_CLOSED_ANGLE);
 
+        armAxis.apply();
+        clawAxis.apply();
+        payloadAxis.apply();
+
+        // Flash the LED red if this boot was a brownout reset.
         brownoutBeacon.arm();
-        userLed.setSolid(0, 255, 0);
+
+        userLed.setSolid(0, 255, 0); // Green ready
     }
 
     void loop() override {
-        refreshRawButtons();
+        readRawButtons();
+
+        // Watch the battery rail. The scale factor backs the drive off when
+        // the pack sags, which is what keeps "drive while gripping" from
+        // resetting the board.
         const float driveScale = powerGuard.update();
 
-        // Update filtered IMU tilt angle every tick
-        float rawDeg = 0.0f;
-        if (readRawImuTilt(rawDeg)) {
-            filteredTiltDeg = (0.75f * filteredTiltDeg) + (0.25f * rawDeg);
-        }
-        const float relativeTiltDeg = filteredTiltDeg - levelZeroDeg;
-
-        // --------------------------------------------------------
-        //  0. BUTTON X TOGGLE — Start / Stop Spacestation Auto-Level
-        // --------------------------------------------------------
-        if (gamepad1.justPressed(BTN_X)) {
-            if (imuAddr != 0) {
-                autoLevelActive = !autoLevelActive;
-                turnActive      = false;
-                prevLevelErrDeg = relativeTiltDeg;
-                prevLevelMs     = millis();
-                if (!autoLevelActive) {
-                    drive.stop();
-                }
-            } else {
-                autoLevelActive = false;
-            }
-        }
-
-        // Instant joystick override cancels auto-turn or auto-level if driver pushes sticks
-        const bool sticksMoved = (fabsf(gamepad1.leftY()) > 0.30f || fabsf(gamepad1.rightY()) > 0.30f);
-        if ((turnActive || autoLevelActive) && sticksMoved) {
-            drive.stop();
-            turnActive      = false;
-            autoLevelActive = false;
+        // A macro that has run to completion gives its part back to the
+        // manual controls. Checked before anything reads activeMacro.
+        if (activeMacro != Macro::NONE && !isActionRunning()) {
+            activeMacro = Macro::NONE;
         }
 
         // --------------------------------------------------------
-        //  1. TURN SHORTCUTS (RB = 140° @ 90%, LB = 50° @ 80%)
+        //  1. GYRO SPIN MACROS (LB = 180°, DPAD_LEFT/RIGHT = ±90°)
         // --------------------------------------------------------
-        if (!turnActive && !autoLevelActive) {
-            if (gamepad1.justPressed(BTN_RB)) {
-                startPrecisionTurn(140.0f, TURN_140_SPEED, TURN_140_MS, TURN_140_DIR);
-            } else if (gamepad1.justPressed(BTN_LB)) {
-                startPrecisionTurn(50.0f,  TURN_50_SPEED,  TURN_50_MS,  TURN_50_DIR);
+        // Guarded so a second press cannot stack two turns on the queue.
+        if (activeMacro != Macro::TURN) {
+            if (gamepad1.justPressed(BTN_LB)) {
+                runAction(driveActions.turn(180));
+                activeMacro        = Macro::TURN;
+                fullStraightActive = false;
+            } else if (gamepad1.justPressed(BTN_DPAD_LEFT)) {
+                runAction(driveActions.turn(-90));
+                activeMacro        = Macro::TURN;
+                fullStraightActive = false;
+            } else if (gamepad1.justPressed(BTN_DPAD_RIGHT)) {
+                runAction(driveActions.turn(90));
+                activeMacro        = Macro::TURN;
+                fullStraightActive = false;
             }
         }
 
         // --------------------------------------------------------
-        //  2. DRIVE — Auto-Level, Precision Turn, or Dual-Stick Tank
+        //  2. DRIVE — tank, or the 100% heading-locked sprint.
+        //     While a turn macro is running it owns the motors.
         // --------------------------------------------------------
-        const float activeMaxDrive = clawGripLocked ? CARRY_MAX_DRIVE : 1.0f;
-
-        if (autoLevelActive) {
-            smoothedLeft  = 0.0f;
-            smoothedRight = 0.0f;
-
-            uint32_t now = millis();
-            float dt = (now - prevLevelMs) * 0.001f;
-            if (dt < 0.005f) dt = 0.01f;
-            prevLevelMs = now;
-
-            float error = relativeTiltDeg;
-            float dErr  = (error - prevLevelErrDeg) / dt;
-            prevLevelErrDeg = error;
-
-            if (fabsf(error) <= LEVEL_DEADBAND_DEG) {
-                drive.stop();
-                telemetry.addData("LEVEL", "BALANCED!");
-            } else {
-                float cmd = (error * LEVEL_KP + dErr * LEVEL_KD) * LEVEL_DRIVE_SIGN;
-                if (cmd > 0.0f) {
-                    cmd = constrain(cmd, LEVEL_MIN_POWER, LEVEL_MAX_POWER);
-                } else {
-                    cmd = constrain(cmd, -LEVEL_MAX_POWER, -LEVEL_MIN_POWER);
-                }
-                drive.drive(cmd * driveScale, 0.0f);
-                telemetry.addData("LEVEL", "BALANCING...");
+        if (activeMacro == Macro::TURN) {
+            // driveActions.turn() is driving — do not fight it for the motors.
+        } else if (rawPressed(BTN_RB)) {
+            if (!fullStraightActive) {
+                lockedHeading = NRLComms::getHeading();
+                fullStraightActive = true;
             }
-        } else if (turnActive) {
-            smoothedLeft  = 0.0f;
-            smoothedRight = 0.0f;
-            updatePrecisionTurn(driveScale);
-            telemetry.addData("DRIVE", "AUTO TURN");
-            telemetry.addData("Turn Deg", turnTargetDegLog);
+
+            // Gyro heading lock. The heading is meaningless until the gyro has
+            // finished its bias calibration (~0.5 s), so drive straight until
+            // then rather than steering on a garbage reference.
+            float headingError   = 0.0f;
+            float turnCorrection = 0.0f;
+            if (NRLComms::isHeadingReady()) {
+                headingError   = lockedHeading - NRLComms::getHeading();
+                turnCorrection = constrain(headingError * 0.04f, -0.3f, 0.3f);
+            }
+
+            // Command 100% full forward speed
+            drive.drive(1.0f * driveScale, turnCorrection);
+
+            telemetry.addData("DRIVE", "FULL STRAIGHT 100%");
+            telemetry.addData("Heading Err", headingError);
         } else {
+            fullStraightActive = false;
+
+            // --------------------------------------------------------
+            //  3. TRUE DUAL-STICK TANK DRIVE
+            // --------------------------------------------------------
+            // Left Stick Y controls Left Wheels, Right Stick Y controls Right Wheels
             float leftStick  = gamepad1.leftY();
             float rightStick = gamepad1.rightY();
 
             const float DEADZONE = 0.05f;
-            if (fabsf(leftStick)  < DEADZONE) leftStick  = 0.0f;
-            if (fabsf(rightStick) < DEADZONE) rightStick = 0.0f;
+            if (abs(leftStick)  < DEADZONE) leftStick  = 0.0f;
+            if (abs(rightStick) < DEADZONE) rightStick = 0.0f;
 
-            float targetL = leftStick  * activeMaxDrive * driveScale;
-            float targetR = rightStick * activeMaxDrive * driveScale;
+            // Kinematic conversion:
+            // Left  = forward + turn = leftStick
+            // Right = forward - turn = rightStick
+            float forward = (leftStick + rightStick) * 0.5f;
+            float turn    = (leftStick - rightStick) * 0.5f;
 
-            if (clawGripLocked) {
-                smoothedLeft  = slewDrive(smoothedLeft,  targetL, CARRY_ACCEL_PER_TICK);
-                smoothedRight = slewDrive(smoothedRight, targetR, CARRY_ACCEL_PER_TICK);
-            } else {
-                smoothedLeft  = targetL;
-                smoothedRight = targetR;
+            drive.drive(forward * driveScale, turn);
+
+            telemetry.addData("DRIVE", "DUAL TANK");
+            telemetry.addData("Left Stick",  leftStick);
+            telemetry.addData("Right Stick", rightStick);
+        }
+
+        // --------------------------------------------------------
+        //  4a. ARM — D-PAD UP / DOWN
+        //
+        //  The D-pad is a set of momentary buttons, read as a LEVEL: hold UP
+        //  and the arm rises, release and it stops where it is. It travels at
+        //  ARM_RATE_DEG_PER_SEC and stops on its own at the calibrated poses.
+        //
+        //  Read from the RAW button state, so a D-pad button already held
+        //  when the OpMode starts works immediately instead of doing nothing
+        //  until it is released and pressed again.
+        // --------------------------------------------------------
+        if (rawPressed(BTN_DPAD_UP)) {
+            armDir = ArmDir::UP;
+        } else if (rawPressed(BTN_DPAD_DOWN)) {
+            armDir = ArmDir::DOWN;
+        } else {
+            armDir = ArmDir::NONE;
+        }
+
+        if (armDir == ArmDir::UP) {
+            // UP = the LOWER angle on this robot (45 deg = carry).
+            if (motionRequest(armAxis)) armAxis.command(ARM_CARRY_ANGLE);
+        } else if (armDir == ArmDir::DOWN) {
+            // DOWN = the HIGHER angle on this robot (115 deg = floor).
+            if (motionRequest(armAxis)) armAxis.command(ARM_FLOOR_ANGLE);
+        } else {
+            // Nothing asked for the arm. Let go of the rail.
+            motionRelease(armAxis);
+        }
+
+        // --------------------------------------------------------
+        //  4b. CLAW — LT / RT TRIGGERS
+        //
+        //  LT and RT are TOGGLE switches on this controller, read as a LEVEL:
+        //  flip one on and the claw travels that way, flip it off and the
+        //  claw stops where it is.
+        //
+        //  Which direction wins when BOTH are engaged: the one flipped most
+        //  recently. `triggerDir` remembers that; the level checks below
+        //  decide whether the remembered direction is still live.
+        // --------------------------------------------------------
+        static ClawDir triggerDir = ClawDir::NONE;
+        static uint16_t prevRaw = 0;
+        if ((rawButtons & BTN_LT) && !(prevRaw & BTN_LT)) {
+            triggerDir = ClawDir::EXPAND;
+        } else if ((rawButtons & BTN_RT) && !(prevRaw & BTN_RT)) {
+            triggerDir = ClawDir::CONTRACT;
+        }
+        prevRaw = rawButtons;
+
+        const bool ltEngaged = rawPressed(BTN_LT);
+        const bool rtEngaged = rawPressed(BTN_RT);
+
+        ClawDir desired = ClawDir::NONE;
+        if (triggerDir == ClawDir::EXPAND && ltEngaged) {
+            desired = ClawDir::EXPAND;          // LT still on, still expanding
+        } else if (triggerDir == ClawDir::CONTRACT && rtEngaged) {
+            desired = ClawDir::CONTRACT;        // RT still on, still contracting
+        } else if (ltEngaged) {
+            desired = ClawDir::EXPAND;          // LT on again after RT released
+        } else if (rtEngaged) {
+            desired = ClawDir::CONTRACT;        // RT on again after LT released
+        }
+
+        // While the auto-grab macro is running it owns the claw.
+        if (activeMacro != Macro::GRAB) {
+            clawCtl.update(desired);
+        }
+
+        // --------------------------------------------------------
+        //  4c. CLAW SNAPS & AUTO-GRAB MACRO
+        // --------------------------------------------------------
+        if (activeMacro != Macro::GRAB) {
+            // Tap BTN_Y to Toggle Grab / Release
+            if (gamepad1.justPressed(BTN_Y)) {
+                if (objectSecured) {
+                    // If currently holding, release immediately
+                    clawCtl.releaseNow();
+                    clawCtl.tryOpen();
+                    objectSecured = false;
+                    gripMemory.set(false);
+                    userLed.setSolid(0, 255, 0);
+                    tone(BUZZER_PIN, 1200, 70);
+                } else {
+                    // Execute Auto Grab
+                    runAction(autoGrabRoutine());
+                    activeMacro = Macro::GRAB;
+                }
             }
 
-            float forward = (smoothedLeft + smoothedRight) * 0.5f;
-            float turn    = (smoothedLeft - smoothedRight) * 0.5f;
-
-            drive.drive(forward, turn);
-            telemetry.addData("LEVEL", imuAddr != 0 ? "OFF (Press X)" : "NO IMU");
+            // Manual snap — shut the claw and press on the piece.
+            //
+            // There is deliberately no "snap open" on BTN_X any more: that
+            // button is the payload gate now. To let go of a piece, press
+            // BTN_Y (release) or flip LT (expand).
+            if (gamepad1.justPressed(BTN_A)) {
+                clawCtl.engageNow();
+                objectSecured = true;
+                gripMemory.set(true);
+            }
         }
 
         // --------------------------------------------------------
-        //  3. ARM (S1) — D-Down = Arm Down + Auto-Open Claw (30°)
-        //                D-Up   = Arm Up
+        //  4d. PAYLOAD GATE — press once to toggle open / closed
+        //
+        //  Just a toggle between two angles. The servo ramps to the target
+        //  on its own, so the target is set once and apply() does the rest.
         // --------------------------------------------------------
-        const bool dpadUp   = isBtnPressed(BTN_DPAD_UP);
-        const bool dpadDown = isBtnPressed(BTN_DPAD_DOWN);
-
-        if (dpadUp && !dpadDown) {
-            armCmdDeg = stepAngle(armCmdDeg, ARM_UP_ANGLE, ARM_STEP_PER_TICK);
-        } else if (dpadDown && !dpadUp) {
-            armCmdDeg = stepAngle(armCmdDeg, ARM_DOWN_ANGLE, ARM_STEP_PER_TICK);
-
-            // Automatically open the claw to 30° when arm goes down
-            clawGripLocked = false;
-            gripMemory.set(false);
-            clawCmdDeg = stepAngle(clawCmdDeg, CLAW_OPEN_ANGLE, CLAW_STEP_PER_TICK);
-        }
-
-        // --------------------------------------------------------
-        //  4. CLAW (S4) — D-Right = Open (30°), D-Left = Close (95°)
-        // --------------------------------------------------------
-        const bool dpadRight = isBtnPressed(BTN_DPAD_RIGHT);
-        const bool dpadLeft  = isBtnPressed(BTN_DPAD_LEFT);
-
-        if (dpadRight && !dpadLeft) {
-            clawGripLocked = false;
-            gripMemory.set(false);
-            clawCmdDeg = stepAngle(clawCmdDeg, CLAW_OPEN_ANGLE, CLAW_STEP_PER_TICK);
-        } else if (dpadLeft && !dpadRight) {
-            clawGripLocked = true;
-            gripMemory.set(true);
-            clawCmdDeg = stepAngle(clawCmdDeg, CLAW_CLOSED_ANGLE, CLAW_STEP_PER_TICK);
-        }
-
-        // --------------------------------------------------------
-        //  5. PAYLOAD SERVO (S3) — Press Button A to Open / Close (90°)
-        // --------------------------------------------------------
-        if (gamepad1.justPressed(BTN_A)) {
+        if (gamepad1.justPressed(PAYLOAD_BUTTON)) {
             payloadOpen = !payloadOpen;
+            payloadAxis.command(payloadOpen ? PAYLOAD_OPEN_ANGLE : PAYLOAD_CLOSED_ANGLE);
+            tone(BUZZER_PIN, payloadOpen ? 2000 : 1400, 60);
         }
-        float payloadTarget = payloadOpen ? PAYLOAD_OPEN_ANGLE : PAYLOAD_CLOSED_ANGLE;
-        payloadCmdDeg = stepAngle(payloadCmdDeg, payloadTarget, PAYLOAD_STEP_PER_TICK);
 
         // --------------------------------------------------------
-        //  6. SEND CLEAN POSITION COMMANDS TO ALL 3 SERVOS
+        //  5. PUSH THE TARGETS TO THE SERVOS
+        //
+        //  This MUST run every tick, and it MUST be the only thing that
+        //  talks to the servos. Two jobs:
+        //
+        //    1. It advances the ramp — the servo only travels while
+        //       setPosition() is being called.
+        //    2. It refreshes the PWM duty every tick, so the servo keeps
+        //       receiving pulses. A servo that is only refreshed every
+        //       250 ms (the driver's idle heartbeat) can drop its pulses
+        //       when the rail sags — which is what "the servo just stops
+        //       working" looks like on the field.
         // --------------------------------------------------------
-        arm.setPosition(armCmdDeg);
-        claw.setPosition(clawCmdDeg);
-        payload.setPosition(payloadCmdDeg);
+        armAxis.apply();
+        clawAxis.apply();
+        payloadAxis.apply();
 
         // --------------------------------------------------------
-        //  7. STATUS LED & LIVE TELEMETRY
+        //  6. STATUS LED MANAGEMENT
         // --------------------------------------------------------
-        if (!brownoutBeacon.service()) {
-            if (power.isBatteryLow()) {
-                userLed.setBlink(255, 0, 0, 300);
-            } else if (autoLevelActive) {
-                userLed.setSolid(0, 180, 255); // Cyan: Auto-Level Active
-            } else if (clawGripLocked) {
-                userLed.setSolid(180, 0, 255); // Purple: Element Gripped
-            } else {
-                userLed.setSolid(0, 255, 0);   // Green: Ready
+        if (brownoutBeacon.service()) {
+            // The beacon owns the LED — it is telling the driver the last
+            // boot was a brownout reset.
+        } else if (power.isBatteryLow()) {
+            userLed.setBlink(255, 0, 0, 300);
+
+            // Beep at most twice a second. A tone() on every 10 ms tick is a
+            // continuous buzz that drowns out the grab chime.
+            static uint32_t lastBeepMs = 0;
+            uint32_t nowMs = millis();
+            if (nowMs - lastBeepMs >= 500) {
+                lastBeepMs = nowMs;
+                tone(BUZZER_PIN, 1000, 50);
             }
+        } else if (activeMacro == Macro::GRAB) {
+            // The grab macro owns the LED (orange = clamping, purple = secured).
+        } else if (fullStraightActive) {
+            userLed.setSolid(255, 255, 255); // White LED: FULL SPRINT
+        } else if (objectSecured) {
+            userLed.setSolid(180, 0, 255);   // Purple: Object Secured
+        } else {
+            userLed.setSolid(0, 255, 0);     // Green: Ready
         }
 
-        telemetry.addData("Tilt Deg",  relativeTiltDeg);
-        telemetry.addData("Arm (S1)",  armCmdDeg);
-        telemetry.addData("Claw (S4)", clawCmdDeg);
-        telemetry.addData("Pay (S3)",  payloadCmdDeg);
-        telemetry.addData("Payload",   payloadOpen ? "OPEN (90)" : "CLOSED (0)");
+        // --------------------------------------------------------
+        //  7. TELEMETRY
+        // --------------------------------------------------------
+        // RAW shows the button bits actually arriving from the controller, so
+        // a control that does nothing can be traced (an empty RAW while a
+        // button is held means the controller is not sending that bit).
+        telemetry.addData("Arm Angle",  armAxis.actual());
+        telemetry.addData("Claw Angle", clawAxis.actual());
+        telemetry.addData("Arm",        armDir  == ArmDir::UP   ? "UP" :
+                                     armDir  == ArmDir::DOWN ? "DOWN" : "HOLD");
+        telemetry.addData("Claw",       clawCtl.dir == ClawDir::EXPAND   ? "EXPAND" :
+                                     clawCtl.dir == ClawDir::CONTRACT ? "CONTRACT" : "HOLD");
+        telemetry.addData("Grip",       clawCtl.isGripping() ? "PRESSING" : "loose");
+        telemetry.addData("Payload",     payloadOpen ? "GATE OPEN" : "GATE CLOSED");
+        telemetry.addData("Pay Angle",  payloadAxis.actual());
+        telemetry.addData("Object",     objectSecured ? "SECURED" : "NONE");
+        telemetry.addData("Drive Sc",   driveScale);
+        telemetry.addData("Heading",    NRLComms::getHeading());
+        telemetry.addData("RAW",        rawButtons);
         team205ReportPower(telemetry, powerGuard);
     }
 
     void stop() override {
         cancelActions();
         drive.stop();
+
+        // A clean stop means the match is over — clear the persisted grip so
+        // the next run does not come up clamping onto nothing. (A BROWNOUT
+        // never reaches here, which is exactly why the memory is useful.)
         gripMemory.set(false);
-        turnActive      = false;
-        autoLevelActive = false;
 
         arm.detach();
         claw.detach();
         payload.detach();
         userLed.setOff();
+        noTone(BUZZER_PIN);
     }
 };
 
